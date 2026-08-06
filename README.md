@@ -142,9 +142,7 @@ api.place_order("SPY", qty=10, side="buy")
 - [ ] **Ensemble predictions**: Train multiple NNs with different architectures and ensemble outputs
 - [ ] **Multi-asset**: Expand from SPY to a basket of S&P 500 constituents
 - [ ] **Walk-forward validation**: Replace static 50/50 split with rolling window backtesting
-- [ ] **Live paper trading**: Connect `api_caller.py` to Alpaca paper account
 - [ ] **Macro features**: Integrate VIX, yield curve, or sector rotation signals (selectively — too many features degrade performance)
-- [ ] **Model tiers**: Follow Krafer's tiered approach (Bobcat → Panther → Lion → Tiger for longer horizons)
 
 ---
 
