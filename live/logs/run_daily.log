@@ -1,0 +1,181 @@
+[2026-10-09 13:44:06] started; press Ctrl+C to stop
+[2026-10-09 13:44:06] market open; rebalancing in 111 min (136 min before close)
+[2026-10-09 13:51:46] started (every 60 min + near the close); press Ctrl+C to stop
+[2026-10-09 13:51:46] running: paper_trade.py --execute
+Model trained 2026-10-09T13:36:48 on 2022-10-13 .. 2026-10-08
+Prices through 2026-10-09 (496 stocks)
+Alpaca paper account: equity $100,000, 0 open positions
+
+Target book: 210 longs ($53,337), 184 shorts ($42,565), net $10,772
+Orders: 0 reduce/close + 366 open/increase, about $95,533 traded (96% of equity)
+
+Largest target weights:
+  TAP    +1.859%
+  CSGP   +1.664%
+  MRVL   +1.246%
+  KLAC   +1.246%
+  PPG    +1.203%
+  XEL    +1.095%
+  LRCX   +0.982%
+  TPL    +0.951%
+  MU     +0.940%
+  LEN    +0.912%
+
+Saved targets and order plan to C:\Users\alche\Dropbox\papers_impl\live\logs
+
+Phase 1: reducing / closing positions ...
+Phase 2: opening / increasing positions ...
+Submitted 366 of 366 orders.
+[2026-10-09 13:53:08] paper_trade.py finished with exit code 0
+[2026-10-09 13:53:08] market open; next rebalance in 59 min
+[2026-10-09 14:14:06] market open; rebalancing in 81 min (106 min before close)
+[2026-10-09 14:23:08] market open; next rebalance in 29 min
+[2026-10-09 14:44:06] market open; rebalancing in 51 min (76 min before close)
+[2026-10-09 14:51:46] running: paper_trade.py --execute
+Model trained 2026-10-09T13:36:48 on 2022-10-13 .. 2026-10-08
+Prices through 2026-10-09 (496 stocks)
+Alpaca paper account: equity $99,995, 366 open positions
+
+Target book: 215 longs ($53,373), 181 shorts ($42,577), net $10,796
+Orders: 61 reduce/close + 61 open/increase, about $10,000 traded (10% of equity)
+
+Largest target weights:
+  TAP    +1.832%
+  CSGP   +1.627%
+  PPG    +1.230%
+  KLAC   +1.226%
+  MRVL   +1.224%
+  XEL    +1.148%
+  LRCX   +1.031%
+  MU     +0.963%
+  IFF    +0.960%
+  TPL    +0.924%
+
+Saved targets and order plan to C:\Users\alche\Dropbox\papers_impl\live\logs
+
+Phase 1: reducing / closing positions ...
+Phase 2: opening / increasing positions ...
+Submitted 122 of 122 orders.
+[2026-10-09 14:52:58] paper_trade.py finished with exit code 0
+[2026-10-09 14:52:58] market open; next rebalance in 42 min
+[2026-10-09 15:14:07] market open; rebalancing in 21 min (46 min before close)
+[2026-10-09 15:22:58] market open; next rebalance in 12 min
+[2026-10-09 15:34:59] running: paper_trade.py --execute
+[2026-10-09 15:35:00] running: paper_trade.py --execute
+Model trained 2026-10-09T13:36:48 on 2022-10-13 .. 2026-10-08
+Prices through 2026-10-09 (496 stocks)
+Alpaca paper account: equity $99,964, 376 open positions
+
+Target book: 214 longs ($53,793), 180 shorts ($42,802), net $10,991
+Orders: 38 reduce/close + 55 open/increase, about $10,447 traded (10% of equity)
+
+Largest target weights:
+  TAP    +1.836%
+  CSGP   +1.714%
+  KLAC   +1.277%
+  PPG    +1.240%
+  MRVL   +1.239%
+  MU     +1.196%
+  XEL    +1.146%
+  LRCX   +1.019%
+  EME    +1.009%
+  SJM    +0.884%
+
+Saved targets and order plan to C:\Users\alche\Dropbox\papers_impl\live\logs
+
+Phase 1: reducing / closing positions ...
+Phase 2: opening / increasing positions ...
+Submitted 93 of 93 orders.
+[2026-10-09 15:35:55] paper_trade.py finished with exit code 0
+[2026-10-09 15:35:55] done for today; waiting for the market to close
+Model trained 2026-10-09T13:36:48 on 2022-10-13 .. 2026-10-08
+Prices through 2026-10-09 (496 stocks)
+Alpaca paper account: equity $100,000, 0 open positions
+
+Target book: 215 longs ($53,818), 180 shorts ($43,038), net $10,780
+Orders: 0 reduce/close + 376 open/increase, about $96,628 traded (97% of equity)
+
+Largest target weights:
+  TAP    +1.834%
+  CSGP   +1.712%
+  KLAC   +1.277%
+  PPG    +1.237%
+  MRVL   +1.229%
+  MU     +1.195%
+  XEL    +1.145%
+  LRCX   +1.018%
+  EME    +1.006%
+  SJM    +0.883%
+
+Saved targets and order plan to C:\Users\alche\Dropbox\papers_impl\live\logs
+
+Phase 1: reducing / closing positions ...
+Phase 2: opening / increasing positions ...
+Submitted 376 of 376 orders.
+[2026-10-09 15:36:44] paper_trade.py finished with exit code 0
+[2026-10-09 15:36:44] done for today; waiting for the market to close
+[2026-10-09 16:01:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 16:31:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 16:31:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 17:01:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 17:01:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 17:31:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 17:31:00] market closed; next open Mon Oct 12 09:30 -04:00
+[2026-10-09 17:32:45] stopped by user
+[2026-10-09 17:32:47] stopped by user
+[2026-10-15 15:39:24] started (once a day); press Ctrl+C to stop
+[2026-10-15 15:39:24] running: paper_trade.py --execute
+[2026-10-15 15:40:31] started (every 60 min + near the close); press Ctrl+C to stop
+[2026-10-15 15:40:32] running: paper_trade.py --execute
+Model trained 2026-10-09T13:36:48 on 2022-10-13 .. 2026-10-08
+Prices through 2026-10-15 (496 stocks)
+Alpaca paper account: equity $100,358, 376 open positions
+
+Target book: 226 longs ($54,927), 171 shorts ($41,199), net $13,728
+Orders: 204 reduce/close + 192 open/increase, about $80,708 traded (80% of equity)
+
+Largest target weights:
+  KLAC   +1.357%
+  TSLA   +1.297%
+  ALGN   +1.294%
+  MRK    +1.164%
+  HII    +1.100%
+  TYL    +1.070%
+  HUBB   +1.043%
+  NUE    +1.008%
+  AEP    +1.002%
+  OTIS   +0.975%
+
+Saved targets and order plan to C:\Users\alche\Dropbox\papers_impl\live\logs
+
+Phase 1: reducing / closing positions ...
+Phase 2: opening / increasing positions ...
+Submitted 396 of 396 orders.
+[2026-10-15 15:41:03] paper_trade.py finished with exit code 0
+[2026-10-15 15:41:03] done for today; waiting for the market to close
+Model trained 2026-10-09T13:36:48 on 2022-10-13 .. 2026-10-08
+Prices through 2026-10-15 (496 stocks)
+Alpaca paper account: equity $100,339, 379 open positions
+
+Target book: 227 longs ($54,923), 170 shorts ($41,434), net $13,489
+Orders: 199 reduce/close + 194 open/increase, about $80,519 traded (80% of equity)
+
+Largest target weights:
+  KLAC   +1.421%
+  ALGN   +1.320%
+  TSLA   +1.296%
+  MRK    +1.152%
+  HII    +1.114%
+  TYL    +1.087%
+  AEP    +1.007%
+  NUE    +1.005%
+  HUBB   +0.993%
+  OTIS   +0.971%
+
+Saved targets and order plan to C:\Users\alche\Dropbox\papers_impl\live\logs
+
+Phase 1: reducing / closing positions ...
+Phase 2: opening / increasing positions ...
+Submitted 393 of 393 orders.
+[2026-10-15 15:42:05] paper_trade.py finished with exit code 0
+[2026-10-15 15:42:05] done for today; waiting for the market to close
