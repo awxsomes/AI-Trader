@@ -42,19 +42,38 @@ def connect():
 
 
 def alpaca_assets(client):
-    from alpaca.trading.requests import GetAssetsRequest
-    from alpaca.trading.enums import AssetClass, AssetStatus
-    assets = client.get_all_assets(GetAssetsRequest(
-        status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY))
-    return {a.symbol: a for a in assets}
+    """Tradable US stocks, as raw API data.
+
+    Uses the raw endpoint rather than client.get_all_assets(): the library
+    validates every asset strictly, so one unfamiliar field value (e.g. the
+    new 'TXSE' exchange in Oct 2026) made the whole call fail.
+    """
+    from types import SimpleNamespace
+    raw = client.get("/assets", {"status": "active", "asset_class": "us_equity"})
+    return {a["symbol"]: SimpleNamespace(
+                tradable=bool(a.get("tradable")),
+                shortable=bool(a.get("shortable")),
+                easy_to_borrow=bool(a.get("easy_to_borrow")),
+                fractionable=bool(a.get("fractionable")))
+            for a in raw if "symbol" in a}
 
 
 def current_positions(client):
     pos = {}
-    for p in client.get_all_positions():
-        q = float(p.qty)
-        pos[p.symbol] = q          # qty is negative for shorts
+    for p in client.get("/positions"):     # raw data, same reason as above
+        pos[p["symbol"]] = float(p["qty"])  # qty is negative for shorts
     return pos
+
+
+def cancel_open_orders(client):
+    """Cancel leftovers from earlier rebalances so they can't block this one
+    (Alpaca rejects orders on shares already held for another open order)."""
+    try:
+        res = client.delete("/orders")
+        return len(res) if isinstance(res, list) else 0
+    except Exception as e:
+        print(f"  could not cancel open orders: {e}")
+        return 0
 
 
 def submit(client, symbol, qty, side):
@@ -70,12 +89,10 @@ def submit(client, symbol, qty, side):
 
 
 def wait_for_fills(client, timeout=180):
-    from alpaca.trading.requests import GetOrdersRequest
-    from alpaca.trading.enums import QueryOrderStatus
     t0 = time.time()
+    open_orders = []
     while time.time() - t0 < timeout:
-        open_orders = client.get_orders(GetOrdersRequest(
-            status=QueryOrderStatus.OPEN, limit=500))
+        open_orders = client.get("/orders", {"status": "open", "limit": 500})
         if not open_orders:
             return 0
         time.sleep(5)
@@ -112,6 +129,16 @@ def plan_orders(target_qty: dict, current_qty: dict, prices: dict,
             phase1.append((sym, abs(cur) - abs(tgt), "sell" if cur > 0 else "buy"))
         else:
             phase2.append((sym, abs(tgt) - abs(cur), "buy" if tgt > 0 else "sell"))
+
+    def ok(order, floor):
+        sym, qty, _ = order
+        px = prices.get(sym, np.nan)
+        if not np.isfinite(px):
+            return True
+        # Alpaca rejects fractional orders under $1; also skip tiny new legs
+        return qty * px >= floor or (float(qty).is_integer() and floor <= 1)
+    phase1 = [o for o in phase1 if ok(o, 1.0)]
+    phase2 = [o for o in phase2 if ok(o, max(1.0, min_trade))]
     return phase1, phase2
 
 
@@ -250,6 +277,10 @@ def main():
     if not clock.is_open and not args.allow_closed:
         sys.exit("Market is closed. Run during market hours (ideally 3:30-3:50 PM "
                  "ET), or add --allow-closed to queue orders for the next open.")
+    n_cancel = cancel_open_orders(client)
+    if n_cancel:
+        print(f"\nCancelled {n_cancel} open orders left from earlier runs.")
+        time.sleep(3)
     failures = []
     print("\nPhase 1: reducing / closing positions ...")
     for sym, qty, side in phase1:

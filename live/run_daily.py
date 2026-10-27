@@ -40,13 +40,25 @@ def log(msg):
 def run_script(name, extra=()):
     cmd = [sys.executable, os.path.join(HERE, name), *extra]
     log("running: " + " ".join(os.path.basename(c) for c in cmd[1:]))
-    with open(LOG, "a", encoding="utf-8") as f:
+    # time limit so a stuck download can't freeze the loop for hours
+    limit = 45 * 60 if name == "train_live.py" else 15 * 60
+    try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, cwd=os.path.dirname(HERE))
-        print(p.stdout, flush=True)
-        f.write(p.stdout)
-    log(f"{name} finished with exit code {p.returncode}")
-    return p.returncode
+                           text=True, cwd=os.path.dirname(HERE), timeout=limit)
+        out, code = p.stdout, p.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        out += f"\n{name} timed out after {limit // 60} min and was stopped.\n"
+        code = -1
+    print(out, flush=True)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(out)
+    if code != 0:
+        log(f"*** {name} FAILED (exit code {code}); no trades this round. "
+            f"See the lines above for the error. ***")
+    else:
+        log(f"{name} finished OK")
+    return code
 
 
 def model_age_days():
