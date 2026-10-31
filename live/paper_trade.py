@@ -25,6 +25,27 @@ sys.path.insert(0, HERE)
 import live_common as lc                                         # noqa: E402
 
 LOG_DIR = os.path.join(HERE, "logs")
+STATE_DIR = os.path.join(HERE, "state")
+
+
+def load_state(account_id):
+    """Per-account memory between rebalances (the cost-aware model's
+    previous allocations). Missing file -> empty state."""
+    import json
+    try:
+        with open(os.path.join(STATE_DIR, f"{account_id}.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(account_id, state):
+    import json
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, f"{account_id}.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(state, f)
+    os.replace(path + ".tmp", path)
 CORR_WINDOW, L_WINDOW = lc.CORR_WINDOW, lc.L_WINDOW
 
 
@@ -157,6 +178,10 @@ def main():
     ap.add_argument("--allow-closed", action="store_true",
                     help="with --execute, queue orders for the next open "
                          "when the market is closed")
+    ap.add_argument("--lam", type=float, default=None,
+                    help="move this fraction of the way from current holdings "
+                         "to the target each rebalance (default 0.2 for the "
+                         "cost-aware model, 1.0 = full rebalance)")
     args = ap.parse_args()
     os.makedirs(LOG_DIR, exist_ok=True)
     today = dt.datetime.now().strftime("%Y-%m-%d_%H%M")   # log file prefix
@@ -179,19 +204,29 @@ def main():
         print("  WARNING: price data is stale; signals will be out of date.")
     returns = lc.closes_to_returns(close)
 
-    # 3. target weights
-    w = lc.target_weights(returns, model)
+    cost_aware = meta.get("arch") == "paper_cost"
+    lam = args.lam if args.lam is not None else (0.2 if cost_aware else 1.0)
+    print(f"Model type: {'cost-aware (full paper)' if cost_aware else 'original'}; "
+          f"rebalancing {lam:.0%} of the way to the target")
+
+    # 3. account (needed first: the cost-aware model's state is per account)
+    client = connect()
+    acct_id = "dry_run"
+    if client is not None:
+        acct = client.get_account()
+        acct_id = str(acct.account_number)
+    state = load_state(acct_id)
+
+    # 4. target weights
+    w, new_prev = lc.target_weights(returns, model, state.get("prev_in"))
     prices = close.iloc[-1]
 
-    # 4. account
-    client = connect()
     if client is None:
         if args.execute:
             sys.exit("Set ALPACA_API_KEY and ALPACA_SECRET_KEY to place orders.")
         print("No Alpaca keys found: dry run assuming a $100,000 account.")
         equity, current, assets = 100_000.0, {}, None
     else:
-        acct = client.get_account()
         equity = float(acct.equity)
         current = current_positions(client)
         # Only manage the strategy's own universe; leave anything else in the
@@ -225,6 +260,18 @@ def main():
         w = w / w.abs().sum()
         if dropped:
             print(f"  dropped {dropped} names Alpaca can't trade / short")
+
+    # 5b. partial rebalancing: move a fraction lam from the current book to
+    #     the target (cuts turnover; the signal decays slowly, paper III.M)
+    w_target = w.copy()
+    if lam < 1.0:
+        scale = args.gross * equity
+        cur_w = pd.Series({s: q * prices.get(s, np.nan) / scale
+                           for s, q in current.items()}).dropna()
+        syms = w.index.union(cur_w.index)
+        w = (cur_w.reindex(syms, fill_value=0.0) +
+             lam * (w.reindex(syms, fill_value=0.0) - cur_w.reindex(syms, fill_value=0.0)))
+        w = w[w != 0]
 
     # 6. dollar and share targets. Longs use fractional shares where Alpaca
     #    allows it (positions are small: ~$200 each on a $100k account);
@@ -260,7 +307,8 @@ def main():
     for s, v in top.items():
         print(f"  {s:6s} {v:+.3%}")
 
-    pd.DataFrame({"weight": w, "price": prices.reindex(w.index),
+    pd.DataFrame({"weight": w, "model_target": w_target.reindex(w.index),
+                  "price": prices.reindex(w.index),
                   "target_qty": pd.Series(tgt_qty)}).to_csv(
         os.path.join(LOG_DIR, f"{today}_targets.csv"))
     pd.DataFrame(phase1 + phase2, columns=["symbol", "qty", "side"]).assign(
@@ -271,6 +319,9 @@ def main():
     if not args.execute:
         print("\nDry run only. Add --execute to place these paper orders.")
         return
+    # remember this allocation as the model's "previous allocation" input
+    save_state(acct_id, {"prev_in": new_prev, "saved_at": today,
+                         "model_trained_at": meta.get("trained_at")})
 
     # 7. execute
     clock = client.get_clock()

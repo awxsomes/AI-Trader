@@ -1,0 +1,12 @@
+﻿__pycache__/
+*.pyc
+*.parquet
+*.npz
+*.pt
+live/logs/
+live/logs_old_model/
+live/state/
+output/*.log
+output/full/*.log
+output/full/*.sh
+.env

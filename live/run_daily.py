@@ -79,6 +79,11 @@ def main():
                          "open (e.g. 60 = hourly); 0 = once a day (default)")
     ap.add_argument("--gross", type=float, default=None,
                     help="passed through to paper_trade.py")
+    ap.add_argument("--lam", type=float, default=None,
+                    help="passed through to paper_trade.py: fraction of the way "
+                         "to the target per rebalance (default 0.2 per day for "
+                         "the cost-aware model; scaled down automatically when "
+                         "--every-minutes rebalances several times a day)")
     args = ap.parse_args()
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
 
@@ -88,14 +93,29 @@ def main():
     extra = ["--execute"]
     if args.gross is not None:
         extra += ["--gross", str(args.gross)]
+    every = args.every_minutes
+    lam_day = args.lam
+    if lam_day is None:
+        try:
+            lam_day = 0.2 if lc.load_model()[1].get("arch") == "paper_cost" else 1.0
+        except FileNotFoundError:
+            lam_day = 0.2
+    if every > 0 and lam_day < 1.0:
+        # several rebalances a day: pick a per-run step that compounds to
+        # the same daily speed, (1 - lam_run)^runs = 1 - lam_day
+        runs = int(390 // every) + 1
+        lam_run = 1 - (1 - lam_day) ** (1 / runs)
+    else:
+        lam_run = lam_day
+    extra += ["--lam", f"{lam_run:.4f}"]
 
     traded_on = None          # session date of the near-close rebalance
     last_trade_at = None      # time of the last rebalance of any kind
     retrain_tried_on = None
     force_now = args.now
-    every = args.every_minutes
     mode = f"every {every:g} min + near the close" if every > 0 else "once a day"
-    log(f"started ({mode}); press Ctrl+C to stop")
+    log(f"started ({mode}; {lam_run:.1%} of the way to target per rebalance); "
+        f"press Ctrl+C to stop")
 
     while True:
         try:

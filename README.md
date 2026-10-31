@@ -29,13 +29,23 @@ papers_impl/
     residuals.py            step 1: PCA factor model -> residual returns
     models.py               step 2: OU, Fourier+FFN, CNN+Transformer models
     backtest.py             step 3: rolling out-of-sample backtest
+  full/                   Paper 2, full version (section 3.3)
+    make_pca_maps.py        PCA residuals + per-day factor maps (stock-space trading)
+    ipca.py                 13 price/volume characteristics + IPCA factor model
+    model_full.py           CNN+Transformer exactly as in the paper's appendix
+    backtest_full.py        stock-space backtest with trading costs
+    execution_study.py      partial rebalancing toward the model's targets
+    analyze_full.py         tables and figures
   live/                   Paper 2 live paper trading
     live_common.py          shared live logic (data, signals, weights)
     train_live.py           trains the model on recent data and saves it
     paper_trade.py          computes today's targets and trades on Alpaca
+    run_daily.py            keeps running and rebalances every trading day
     model_cnn_trans.pt      the saved model (created by train_live.py)
+    state/                  per-account memory between rebalances
     logs/                   daily targets, order plans, errors
   output/                 figures and CSVs written by the scripts
+    full/                   results of the full version
 ```
 
 ## 2. Setup (once per computer)
@@ -164,27 +174,90 @@ today's S&P 500 members instead of a historical member list. That last
 point (survivorship bias) makes all the backtest returns look better than
 they would have been in real time.
 
+**Important:** these numbers are before trading costs, and the results
+above trade residual portfolios directly. Section 3.3 adds costs and
+real stock positions, and the picture changes a lot.
+
+### 3.3 Paper 2, full version: characteristics, stock positions, trading costs
+
+```powershell
+python full\make_pca_maps.py                       # PCA residuals + factor maps
+python full\ipca.py                                # characteristic-based factors
+python full\backtest_full.py --family pca5 --cost-train
+python full\backtest_full.py --family ipca5 --cost-train
+python full\backtest_full.py --family pca5         # trained without costs
+python full\execution_study.py cnn_pca5_cost       # partial rebalancing
+python full\analyze_full.py                        # tables and figures
+```
+
+Each backtest takes about an hour on a laptop CPU.
+
+This version adds the parts of the paper the first version skipped:
+
+- **Characteristic-based factors (IPCA, Kelly, Pruitt & Su 2019).** Each
+  stock's factor exposures depend on its characteristics, estimated yearly
+  on up to 240 months of data. The paper uses 46 characteristics from
+  accounting databases; from price and volume data we can build 13 of them
+  (momentum and reversal over several horizons, beta, volatility,
+  idiosyncratic volatility, distance from the 52-week high, dollar volume,
+  abnormal volume, and a high-low bid-ask spread estimate).
+- **Trading real stock positions.** Residual weights are mapped to stock
+  weights every day and returns are computed on the stocks, as in the
+  paper's main tables.
+- **Trading costs** (paper Section III.J): 5 basis points per unit of
+  turnover plus 1 basis point per day on shorts, subtracted from returns in
+  both training and evaluation. The cost-aware model also sees each stock's
+  previous allocation, so it can learn to avoid unnecessary trading.
+- **The exact network** from the paper's appendix (instance normalization,
+  residual connection, post-norm transformer with dropout, 125-day training
+  batches). Only the last time step's transformer output is used, so it is
+  computed alone; this is mathematically identical and 8x faster.
+- **Partial rebalancing:** instead of jumping to each day's target, move a
+  fraction of the way there. The paper shows the signal fades over about a
+  week, so following it with a lag keeps most of the profit while trading
+  far less.
+
+**Main result** (details in `RESULTS.md`): before costs, every neural network
+version still looks good (Sharpe 1.6 to 2.8). After costs, models trained
+without costs lose 8-9% a year, because they turn over more than the whole
+book daily. The only version that stays profitable after costs is PCA
+factors + cost-aware training + 20%-per-day partial rebalancing: Sharpe 0.75
+after costs (+2.1% a year), +2.3% a year in 2021-2026, worst drawdown -6%.
+This is now what the live bots run.
+
 ---
 
 ## 4. Live paper trading on Alpaca
 
 ### 4.1 How it works each day
 
-`live/paper_trade.py` runs the same three steps on today's data:
+`live/paper_trade.py` runs the full-paper version (section 3.3) on today's
+data:
 
 1. downloads the last ~13 months of daily prices for the 496 stocks from
    Yahoo Finance (during market hours, the latest bar is today's price so
    far),
-2. computes the last 30 days of residuals and today's factor model,
-3. runs the saved CNN + Transformer to get a weight per residual portfolio,
+2. computes the last 30 days of PCA residuals and today's factor model,
+3. runs the saved cost-aware CNN + Transformer to get a weight per residual
+   portfolio. It also feeds in each stock's previous allocation, which the
+   script remembers between runs in `live\state\<account number>.json`
+   (one file per Alpaca account, so several bots don't mix),
 4. converts residual weights into **stock** weights. Holding a residual
    means holding the stock and hedging its factor exposure with other
    stocks; these hedges are netted across all residuals
    (`w_stocks = (I - W B) w_residuals` in `statarb/residuals.py`), and the
    weights are scaled so the absolute values add to 1,
-5. turns weights into share quantities for your account size and sends
-   market orders to Alpaca to move from the current positions to the
-   targets.
+5. **moves 20% of the way** from the positions you hold now to that target
+   (partial rebalancing, `--lam`), which cuts trading costs,
+6. turns weights into share quantities for your account size and sends
+   market orders to Alpaca.
+
+A brand-new empty account therefore builds its positions gradually over
+about a week rather than all on day one.
+
+Models trained before October 29, 2026 (the original version, without
+costs) still load and run with a full daily rebalance, but they lose money
+after trading costs in the backtest, so retrain (section 4.2, step 3).
 
 Orders go in two phases: first everything that reduces or closes a
 position, then (after those fill) everything that opens or adds. Alpaca
@@ -230,7 +303,9 @@ Expect roughly +20-30% net long in dollars.
    ```
 
    This downloads ~7 years of prices from Yahoo, computes residuals, trains
-   on the last 1000 trading days, and saves `live\model_cnn_trans.pt`.
+   the cost-aware model (40 epochs) on the last 1000 trading days, and
+   saves `live\model_cnn_trans.pt`. `--legacy` trains the original model
+   instead.
    Re-run it about once a month. If Yahoo downloads fail, you can train on
    your local files instead:
    `python live\train_live.py --source local`
@@ -267,6 +342,7 @@ Useful options:
 | `--execute` | actually place the paper orders |
 | `--gross 0.5` | use half the account (default 1.0 = gross exposure equal to equity) |
 | `--min-trade 50` | skip trades smaller than $50 |
+| `--lam 0.3` | move 30% of the way to the target (default 0.2 per day; 1 = full rebalance). With `run_daily.py --every-minutes N` the step is scaled down automatically so the daily speed stays the same |
 | `--allow-closed` | queue orders for the next open when the market is closed |
 | `--source local` | use your local parquet files instead of Yahoo (only for testing; they're out of date) |
 
@@ -288,15 +364,16 @@ trading.
 
 ### 4.5 What to expect, honestly
 
-- **Trading costs are the big unknown.** The backtest ignored them. The
-  strategy turns over a large part of the book every day (the first day
-  is 100%), and on a 5.8%-a-year strategy even small costs matter.
-  Alpaca charges no commission, but you still pay the bid-ask spread.
-  Paper trading fills at quoted prices and understates this.
-- **Paper fills are optimistic** in general (no market impact, easy
-  shorting).
-- **Day-to-day results are noisy.** Even at a Sharpe of 2.6, a month can
-  easily be negative. Judge it over several months.
+- **Expect small numbers.** After costs, the backtest of the live setup
+  earns about 2% a year with a Sharpe of 0.75: roughly one losing year in
+  three, and a worst drawdown of 6%. On $100k that is about $2,000 a year,
+  with daily swings of about plus or minus $130.
+- **Costs are modeled simply** (5 bp per unit of turnover, 1 bp a day on
+  shorts). Alpaca charges no commission, but you pay the bid-ask spread on
+  every trade. Paper trading fills at quoted prices, with no market impact
+  and easy shorting, so paper results are somewhat optimistic.
+- **Day-to-day results are noisy.** At a Sharpe of 0.75, even a whole
+  quarter can easily be negative. Judge it over several months, not days.
 - **This is a research replication,** not a tested trading system. Don't
   move it to a real-money account without much more testing.
 

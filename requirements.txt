@@ -1,0 +1,7 @@
+﻿numpy
+pandas
+pyarrow
+matplotlib
+torch
+yfinance
+alpaca-py

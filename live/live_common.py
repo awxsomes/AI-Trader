@@ -20,8 +20,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "statarb"))
+sys.path.insert(0, os.path.join(ROOT, "full"))
 
 from models import L_WINDOW, CNNTransformer                     # noqa: E402
+from model_full import CNNTransformerPaper                       # noqa: E402
 from residuals import (compute_residuals, fit_factor_model,      # noqa: E402
                        residual_to_stock_weights, CORR_WINDOW, K_FACTORS,
                        BETA_WINDOW, MIN_STOCKS)
@@ -88,19 +90,28 @@ def load_model(path: str = MODEL_PATH):
         raise FileNotFoundError(
             f"No trained model at {path}. Run: python live\\train_live.py")
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = CNNTransformer()
+    meta = ckpt.get("meta", {})
+    if meta.get("arch") == "paper_cost":
+        model = CNNTransformerPaper(use_prev=True)      # full-paper, cost-aware
+    else:
+        model = CNNTransformer()                         # original version
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    return model, ckpt.get("meta", {})
+    return model, meta
 
 
 # ---------------------------------------------------------------------------
 # Signals -> target stock weights
 # ---------------------------------------------------------------------------
 
-def target_weights(returns: pd.DataFrame, model) -> pd.Series:
+def target_weights(returns: pd.DataFrame, model, prev_in: dict = None):
     """Target stock weights (sum |w| = 1) to hold from the last date in
     `returns` until the next rebalance.
+
+    For the cost-aware model, prev_in maps ticker -> that residual's previous
+    (normalized) allocation, the extra model input of Section III.J.
+    Returns (weights, new_prev_in) where new_prev_in should be saved and
+    passed in at the next rebalance.
 
     Needs at least CORR_WINDOW + L_WINDOW + 1 rows of returns.
     """
@@ -127,12 +138,22 @@ def target_weights(returns: pd.DataFrame, model) -> pd.Series:
     # (c) model weights on residual portfolios
     trade_cols = [c for c in cols if has_window.get(c, False)]
     X = res[trade_cols].cumsum().to_numpy(np.float32).T.copy()   # (n, L)
+    prev_in = prev_in or {}
+    prev = np.array([prev_in.get(c, 0.0) for c in trade_cols], dtype=np.float32)
     with torch.no_grad():
-        w_tr = model(torch.from_numpy(X)).numpy().astype(np.float64)
+        if isinstance(model, CNNTransformerPaper):
+            out = model(torch.from_numpy(X), torch.from_numpy(prev))
+        else:
+            out = model(torch.from_numpy(X))
+        w_tr = out.numpy().astype(np.float64)
     w_eps = pd.Series(0.0, index=cols)
     w_eps[trade_cols] = w_tr
+    # previous-allocation input for next time (same scaling as the backtest)
+    s = np.abs(w_tr).sum()
+    new_prev = {c: float(v / s * len(trade_cols)) if s > 0 else 0.0
+                for c, v in zip(trade_cols, w_tr)}
 
     # (d) residual weights -> stock weights, normalized to sum |w| = 1
     w_R = residual_to_stock_weights(w_eps.to_numpy(), W, B)
     w_R = pd.Series(w_R, index=cols)
-    return w_R / w_R.abs().sum()
+    return w_R / w_R.abs().sum(), new_prev

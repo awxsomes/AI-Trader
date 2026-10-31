@@ -77,7 +77,12 @@ def residual_to_stock_weights(w_eps: np.ndarray, W: np.ndarray,
 
 def compute_residuals(returns: pd.DataFrame, k: int = K_FACTORS,
                       corr_win: int = CORR_WINDOW, beta_win: int = BETA_WINDOW,
-                      start: str = None, verbose: bool = True) -> pd.DataFrame:
+                      start: str = None, verbose: bool = True,
+                      return_maps: bool = False):
+    """Out-of-sample residuals. With return_maps=True also returns per-day
+    factor maps Wd, Bd of shape (T, N, k) (zeros for stocks outside that
+    day's universe) such that eps_t = R_t - (R_t @ Wd[t]) @ Bd[t].T, i.e.
+    stock weights for residual weights w are w - Wd[t] @ (Bd[t].T @ w)."""
     dates = returns.index
     first = corr_win + 1
     if start is not None:
@@ -85,6 +90,9 @@ def compute_residuals(returns: pd.DataFrame, k: int = K_FACTORS,
     R = returns.to_numpy(dtype=np.float64)
     T, N = R.shape
     out = np.full((T, N), np.nan)
+    if return_maps:
+        Wd = np.zeros((T, N, k), dtype=np.float32)
+        Bd = np.zeros((T, N, k), dtype=np.float32)
 
     for ti in range(first, T):
         Rw = R[ti - corr_win:ti]                      # past 252 days (t-252..t-1)
@@ -97,10 +105,16 @@ def compute_residuals(returns: pd.DataFrame, k: int = K_FACTORS,
         r_t = R[ti, idx]
         eps_t = r_t - (r_t @ W) @ B                   # out-of-sample residual
         out[ti, idx] = eps_t
+        if return_maps:
+            Wd[ti, idx] = W
+            Bd[ti, idx] = B.T
         if verbose and ti % 500 == 0:
             print(f"  {dates[ti].date()}  universe={len(idx)}")
     res = pd.DataFrame(out, index=dates, columns=returns.columns)
-    res = res.dropna(how="all")
+    keep = res.notna().any(axis=1).to_numpy()
+    res = res[keep]
+    if return_maps:
+        return res, Wd[keep], Bd[keep]
     return res
 
 
