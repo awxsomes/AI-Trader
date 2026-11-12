@@ -130,6 +130,9 @@ def plan_orders(target_qty: dict, current_qty: dict, prices: dict,
     position from long to short (Alpaca rejects that):
       phase 1: reduce / close existing positions,
       phase 2: open / increase positions.
+    Trades smaller than min_trade dollars are skipped in BOTH directions.
+    (An earlier version let every close through while filtering opens, so
+    with small partial-rebalance steps the book only ever shrank.)
     """
     phase1, phase2 = [], []
     for sym in sorted(set(target_qty) | set(current_qty)):
@@ -138,7 +141,9 @@ def plan_orders(target_qty: dict, current_qty: dict, prices: dict,
         if cur == tgt:
             continue
         px = prices.get(sym, np.nan)
-        if tgt != 0 and np.isfinite(px) and abs(tgt - cur) * px < min_trade:
+        if not np.isfinite(px):
+            continue                 # no price: never touch this position
+        if abs(tgt - cur) * px < min_trade:
             continue                                   # not worth trading
         same_side = np.sign(cur) == np.sign(tgt)
         if cur != 0 and (tgt == 0 or not same_side):
@@ -151,16 +156,11 @@ def plan_orders(target_qty: dict, current_qty: dict, prices: dict,
         else:
             phase2.append((sym, abs(tgt) - abs(cur), "buy" if tgt > 0 else "sell"))
 
-    def ok(order, floor):
+    def ok(order):
         sym, qty, _ = order
-        px = prices.get(sym, np.nan)
-        if not np.isfinite(px):
-            return True
-        # Alpaca rejects fractional orders under $1; also skip tiny new legs
-        return qty * px >= floor or (float(qty).is_integer() and floor <= 1)
-    phase1 = [o for o in phase1 if ok(o, 1.0)]
-    phase2 = [o for o in phase2 if ok(o, max(1.0, min_trade))]
-    return phase1, phase2
+        # Alpaca rejects fractional orders under $1
+        return qty * prices[sym] >= 1.0 or float(qty).is_integer()
+    return [o for o in phase1 if ok(o)], [o for o in phase2 if ok(o)]
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +182,15 @@ def main():
                     help="move this fraction of the way from current holdings "
                          "to the target each rebalance (default 0.2 for the "
                          "cost-aware model, 1.0 = full rebalance)")
+    ap.add_argument("--min-coverage", type=float, default=0.95,
+                    help="abort if fewer than this fraction of the universe "
+                         "has a price today (yfinance rate limits)")
+    ap.add_argument("--max-turnover", type=float, default=None,
+                    help="abort if the planned trades exceed this fraction of "
+                         "equity (default 0.6*lam + 0.1; backtest turnover is "
+                         "~30%%/day at lam=1 and ~9%%/day at lam=0.2)")
+    ap.add_argument("--force", action="store_true",
+                    help="trade even if a sanity gate fails")
     args = ap.parse_args()
     os.makedirs(LOG_DIR, exist_ok=True)
     today = dt.datetime.now().strftime("%Y-%m-%d_%H%M")   # log file prefix
@@ -203,6 +212,19 @@ def main():
     if (dt.date.today() - last).days > 4:
         print("  WARNING: price data is stale; signals will be out of date.")
     returns = lc.closes_to_returns(close)
+
+    # sanity gate 1: a thin price panel means yfinance dropped symbols; the
+    # model would then be run on a different universe and every position
+    # without a price would be mishandled
+    n_universe = len(lc.load_universe())
+    n_priced = int(close.iloc[-1].notna().sum())
+    coverage = n_priced / n_universe
+    if coverage < args.min_coverage:
+        msg = (f"only {n_priced}/{n_universe} stocks ({coverage:.0%}) have a "
+               f"price today (need {args.min_coverage:.0%}); ")
+        if not args.force:
+            sys.exit("ABORT: " + msg + "retry later or pass --force.")
+        print("  WARNING: " + msg + "continuing because of --force")
 
     cost_aware = meta.get("arch") == "paper_cost"
     lam = args.lam if args.lam is not None else (0.2 if cost_aware else 1.0)
@@ -261,13 +283,27 @@ def main():
         if dropped:
             print(f"  dropped {dropped} names Alpaca can't trade / short")
 
+    # 5a. positions with no price today are FROZEN: left exactly as they are,
+    #     excluded from the blend below and from the order plan. (Earlier
+    #     versions treated a missing price as "target 0" and closed them,
+    #     then bought them back on the next run.)
+    frozen = sorted(s for s in current
+                    if not np.isfinite(prices.get(s, np.nan)))
+    if frozen:
+        print(f"  freezing {len(frozen)} positions with no price today: "
+              f"{', '.join(frozen[:10])}{' ...' if len(frozen) > 10 else ''}")
+        current = {s: q for s, q in current.items() if s not in frozen}
+        w = w.drop(frozen, errors="ignore")
+    w = w[np.isfinite(prices.reindex(w.index))]
+    w = w / w.abs().sum()
+
     # 5b. partial rebalancing: move a fraction lam from the current book to
     #     the target (cuts turnover; the signal decays slowly, paper III.M)
     w_target = w.copy()
     if lam < 1.0:
         scale = args.gross * equity
-        cur_w = pd.Series({s: q * prices.get(s, np.nan) / scale
-                           for s, q in current.items()}).dropna()
+        cur_w = pd.Series({s: q * prices[s] / scale for s, q in current.items()},
+                          dtype=float)
         syms = w.index.union(cur_w.index)
         w = (cur_w.reindex(syms, fill_value=0.0) +
              lam * (w.reindex(syms, fill_value=0.0) - cur_w.reindex(syms, fill_value=0.0)))
@@ -292,10 +328,18 @@ def main():
             tgt_qty[s] = q
     phase1, phase2 = plan_orders(tgt_qty, current, prices.to_dict(),
                                  args.min_trade)
+    if assets is not None:
+        # Alpaca rejects orders for inactive assets (e.g. delisted after an
+        # acquisition); those positions are settled by the broker instead.
+        inactive = sorted({s for s, _, _ in phase1 + phase2 if s not in assets})
+        if inactive:
+            print(f"  skipping {len(inactive)} inactive symbol(s): {', '.join(inactive)}")
+            phase1 = [o for o in phase1 if o[0] in assets]
+            phase2 = [o for o in phase2 if o[0] in assets]
 
     long_d = sum(q * prices[s] for s, q in tgt_qty.items() if q > 0)
     short_d = -sum(q * prices[s] for s, q in tgt_qty.items() if q < 0)
-    traded = sum(q * prices.get(s, 0) for s, q, _ in phase1 + phase2)
+    traded = float(np.nansum([q * prices.get(s, np.nan) for s, q, _ in phase1 + phase2]))
     print(f"\nTarget book: {sum(q > 0 for q in tgt_qty.values())} longs "
           f"(${long_d:,.0f}), {sum(q < 0 for q in tgt_qty.values())} shorts "
           f"(${short_d:,.0f}), net ${long_d - short_d:,.0f}")
@@ -316,18 +360,32 @@ def main():
         os.path.join(LOG_DIR, f"{today}_orders.csv"), index=False)
     print(f"\nSaved targets and order plan to {LOG_DIR}")
 
+    # sanity gate 2: planned turnover far above the backtest's means a bad
+    # input (stale state file, thin prices, wrong lam), not a real signal
+    max_turn = (args.max_turnover if args.max_turnover is not None
+                else 0.6 * lam + 0.1)
+    if traded / equity > max_turn:
+        msg = (f"planned turnover {traded / equity:.0%} of equity exceeds the "
+               f"limit {max_turn:.0%}; ")
+        if args.execute and not args.force:
+            sys.exit("ABORT: " + msg + "inspect the order plan in logs\\, "
+                     "then pass --force or --max-turnover to override.")
+        print("  WARNING: " + msg + ("continuing because of --force"
+                                    if args.force else "(dry run)"))
+
     if not args.execute:
         print("\nDry run only. Add --execute to place these paper orders.")
         return
     # remember this allocation as the model's "previous allocation" input
-    save_state(acct_id, {"prev_in": new_prev, "saved_at": today,
-                         "model_trained_at": meta.get("trained_at")})
-
     # 7. execute
     clock = client.get_clock()
     if not clock.is_open and not args.allow_closed:
         sys.exit("Market is closed. Run during market hours (ideally 3:30-3:50 PM "
                  "ET), or add --allow-closed to queue orders for the next open.")
+    # saved only once orders are actually going out (an earlier version saved
+    # it before the market check, so a closed-market run changed the state)
+    save_state(acct_id, {"prev_in": new_prev, "saved_at": today,
+                         "model_trained_at": meta.get("trained_at")})
     n_cancel = cancel_open_orders(client)
     if n_cancel:
         print(f"\nCancelled {n_cancel} open orders left from earlier runs.")

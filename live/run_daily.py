@@ -108,6 +108,10 @@ def main():
     else:
         lam_run = lam_day
     extra += ["--lam", f"{lam_run:.4f}"]
+    if lam_run < lam_day:
+        # Smaller steps mean smaller orders; scale the $25 minimum trade the
+        # same way, or every order would be skipped and the bot never trades.
+        extra += ["--min-trade", f"{max(1.0, 25.0 * lam_run / lam_day):.2f}"]
 
     traded_on = None          # session date of the near-close rebalance
     last_trade_at = None      # time of the last rebalance of any kind
