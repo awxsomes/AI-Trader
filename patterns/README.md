@@ -66,10 +66,14 @@ Uses `TRADING_DATA_DIR` like the rest of the repo. For each pattern it
 reports trades, win rate, mean net return, the same for random breakouts
 (same stock, direction, trigger distance, stop/target distances and holding
 limit, on random days) and the difference (`edge_bp`) with its t-statistic,
-separately before 2015 and from 2015 on. It ends by listing the patterns
-with t > 2 in **both** periods. Trade only those:
+separately before 2015 and from 2015 on. The t-statistics are clustered by
+calendar month, because trades bunch up in the same weeks (many double
+bottoms after one sell-off) and per-trade t-statistics overstate the
+evidence. It ends by listing the patterns that, in **both** periods, beat
+random breakouts with t > 2 and make money after costs, plus near misses
+(t > 1.5). Trade only those, for example:
 ```
-python patterns\pattern_trade.py --execute --patterns double_bottom,cup_handle
+python patterns\pattern_trade.py --execute --patterns gap_up,head_shoulders_bottom,triple_bottom
 ```
 Checked on simulated random-walk prices (where no pattern can work): edges
 average zero and no pattern passes both periods, so a pattern that passes on

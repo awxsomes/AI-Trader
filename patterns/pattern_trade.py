@@ -23,6 +23,8 @@ live\\momentum_trade.py has used (they leave a file in live\\state\\).
 Usage (from the repo folder):
     python patterns\\pattern_trade.py                 # dry run: list today's setups
     python patterns\\pattern_trade.py --watch         # dry run through the hour, no orders
+    python patterns\\pattern_trade.py --replay        # after 10:46 ET: replay today's hour
+    python patterns\\pattern_trade.py --replay 2026-11-16   # or any past day
     python patterns\\pattern_trade.py --execute       # trade today's first hour
     python patterns\\pattern_trade.py --execute --loop   # stay running, trade every day
     python patterns\\pattern_trade.py --execute --exit flatten
@@ -99,8 +101,18 @@ def connect():
     return TradingClient(k, s, paper=True)                   # PAPER ONLY
 
 
-def data_client():
+def data_keys():
+    """Market data only needs any Alpaca key pair: the pattern account's,
+    else the main ALPACA_API_KEY / ALPACA_SECRET_KEY. (Orders always use
+    the pattern account's keys.)"""
     k, s = keys()
+    if not k or not s:
+        k, s = os.environ.get("ALPACA_API_KEY"), os.environ.get("ALPACA_SECRET_KEY")
+    return k, s
+
+
+def data_client():
+    k, s = data_keys()
     from alpaca.data.historical import StockHistoricalDataClient
     return StockHistoricalDataClient(k, s)
 
@@ -197,12 +209,13 @@ def to_alpaca(t):
     return t.replace("-", ".")
 
 
-def bars_alpaca(symbols, feed):
+def bars_alpaca(symbols, feed, asof=None):
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import Adjustment, DataFeed
     client = data_client()
-    today = pd.Timestamp.now(tz=NY).normalize()
+    today = (pd.Timestamp(asof, tz=NY) if asof is not None
+             else pd.Timestamp.now(tz=NY).normalize())
     start = (today - pd.Timedelta(days=HISTORY_DAYS)).to_pydatetime()
     end = today.to_pydatetime()                      # midnight: excludes today
     frames = []
@@ -230,11 +243,16 @@ def bars_alpaca(symbols, feed):
     return out
 
 
-def bars_yahoo(tickers):
+def _cutoff(asof):
+    return (pd.Timestamp(asof) if asof is not None
+            else pd.Timestamp.now(tz=NY).normalize().tz_localize(None))
+
+
+def bars_yahoo(tickers, asof=None):
     import yfinance as yf
     df = yf.download(tickers, period="2y", interval="1d", auto_adjust=True,
                      progress=False, threads=True, group_by="ticker")
-    today = pd.Timestamp.now(tz=NY).normalize().tz_localize(None)
+    today = _cutoff(asof)
     out = {}
     for t in tickers:
         try:
@@ -246,9 +264,9 @@ def bars_yahoo(tickers):
     return out
 
 
-def bars_local(tickers, data_dir):
+def bars_local(tickers, data_dir, asof=None):
     import common_data as cd
-    today = pd.Timestamp.now(tz=NY).normalize().tz_localize(None)
+    today = _cutoff(asof)
     out = {}
     for t in tickers:
         try:
@@ -259,18 +277,19 @@ def bars_local(tickers, data_dir):
     return out
 
 
-def get_bars(args):
+def get_bars(args, asof=None):
+    """Daily bars for completed sessions before `asof` (default: today)."""
     tickers = load_universe()
     if args.source == "yahoo":
-        return bars_yahoo(tickers)
+        return bars_yahoo(tickers, asof)
     if args.source == "local":
-        return bars_local(tickers, args.data_dir)
+        return bars_local(tickers, args.data_dir, asof)
     syms = [to_alpaca(t) for t in tickers]
     try:
-        return bars_alpaca(syms, "sip")
+        return bars_alpaca(syms, "sip", asof)
     except Exception as e:
         log(f"  SIP daily bars refused ({str(e)[:60]}); falling back to Yahoo")
-        return bars_yahoo(tickers)
+        return bars_yahoo(tickers, asof)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +338,76 @@ def decide(s, j, o, hi, lo, last):
     if not (d * (target - last) > 0 and d * (last - stop) > 0):
         return ("cancel", "price outside stop/target")
     return ("enter", stop, target)
+
+
+class Book:
+    """Caps and bookkeeping for one trading window. Shared by the live loop
+    and --replay, so a replay applies exactly the live rules."""
+
+    def __init__(self, args, equity, busy=(), gross=0.0, n_pos=0):
+        self.args, self.equity = args, equity
+        self.busy, self.gross, self.n_pos = set(busy), gross, n_pos
+        self.per_pattern, self.dead_groups, self.done = {}, set(), set()
+
+    def step(self, watch, px, label, send):
+        """One price check. px: symbol -> (open, high, low, last) for the
+        session so far. send(entry, row) places the order (or not) and
+        returns (status, order_id). Returns the entries planned now."""
+        a = self.args
+        out = []
+        for k, r in enumerate(watch):
+            if k in self.done or r["group"] in self.dead_groups or r["symbol"] not in px:
+                continue
+            o, hi, lo, last = px[r["symbol"]]
+            dec = decide(r["setup"], r["j"], o, hi, lo, last)
+            if dec is None:
+                continue
+            self.done.add(k)
+            if dec[0] == "cancel":
+                log(f"  {label} skip {r['symbol']} {r['pattern']} "
+                    f"{'long' if r['direction'] > 0 else 'short'}: {dec[1]}")
+                continue
+            self.dead_groups.add(r["group"])      # the other side is off
+            _, stop, target = dec
+            d, sym = r["direction"], r["symbol"]
+            why = None
+            if sym in self.busy:
+                why = "already traded/held today"
+            elif self.n_pos >= a.max_positions:
+                why = f"max positions ({a.max_positions})"
+            elif self.per_pattern.get(r["pattern"], 0) >= a.max_per_pattern:
+                why = f"max {a.max_per_pattern} {r['pattern']} trades today"
+            limit = round(last * (1 + d * a.slippage), 2)
+            stop, target = round(stop, 2), round(target, 2)
+            qty = 0
+            if why is None:
+                if d * (target - limit) < 0.02 or d * (limit - stop) < 0.02:
+                    why = "stop/target too close after rounding"
+                else:
+                    qty = math.floor(min(a.risk * self.equity / abs(limit - stop),
+                                         a.max_pos_frac * self.equity / limit))
+                    if self.gross + qty * limit > a.max_gross * self.equity:
+                        qty = math.floor((a.max_gross * self.equity - self.gross) / limit)
+                    if qty < 1:
+                        why = "no room left (gross exposure cap)"
+            side = "BUY" if d > 0 else "SHORT"
+            if why is not None:
+                log(f"  {label} {side} {sym} {r['pattern']} triggered but skipped: {why}")
+                continue
+            log(f"  {label} {side} {qty} {sym} @ limit {limit:.2f}  stop {stop:.2f}  "
+                f"target {target:.2f}  [{r['pattern']}, armed {r['armed_on']}]")
+            entry = dict(time=label, symbol=sym, pattern=r["pattern"], side=side,
+                         qty=qty, last=last, limit=limit, stop=stop, target=target,
+                         trigger=round(r["trigger"], 2))
+            status, oid = send(entry, r)
+            if not status.startswith("rejected"):
+                self.busy.add(sym)
+                self.n_pos += 1
+                self.gross += qty * limit
+                self.per_pattern[r["pattern"]] = self.per_pattern.get(r["pattern"], 0) + 1
+            entry.update(status=status, order_id=oid)
+            out.append(entry)
+        return out
 
 
 def snapshots(symbols, feed):
@@ -441,81 +530,31 @@ def run_session(args, client):
     gross = sum(abs(q) * (bars[s]["Close"].iloc[-1] if s in bars else 0)
                 for s, q in held.items())
     n_pos = len(held)
-    per_pattern = {}
-    dead_groups = set()
-    done = set()                                  # row ids finished today
     orders = []
     tif = "gtc" if args.exit == "hold" else "day"
     watch = [r for r in usable if r["symbol"] not in busy]
     log(f"watching {len(watch)} setups on {len({r['symbol'] for r in watch})} "
         f"symbols until {end_t:%H:%M} ET")
+    book = Book(args, equity, busy, gross, n_pos)
 
-    while pd.Timestamp.now(tz=NY) < end_t and len(done) < len(watch):
+    def send(e, r):
+        if not args.execute:
+            return "dry_run", ""
+        try:
+            res = submit_bracket(client, e["symbol"], e["qty"], r["direction"],
+                                 e["limit"], e["stop"], e["target"], tif)
+            oid = res.get("id", "")
+            mine[e["symbol"]] = {"entered": stamp, "pattern": r["pattern"],
+                                 "direction": r["direction"], "order_id": oid}
+            save_state(acct_id, state)
+            return res.get("status", "submitted"), oid
+        except Exception as ex:
+            log(f"    order rejected: {ex}")
+            return f"rejected: {str(ex)[:120]}", ""
+
+    while pd.Timestamp.now(tz=NY) < end_t and len(book.done) < len(watch):
         px = snapshots(sorted({r["symbol"] for r in watch}), args.feed)
-        for k, r in enumerate(watch):
-            if k in done or r["group"] in dead_groups or r["symbol"] not in px:
-                continue
-            o, hi, lo, last = px[r["symbol"]]
-            dec = decide(r["setup"], r["j"], o, hi, lo, last)
-            if dec is None:
-                continue
-            done.add(k)
-            if dec[0] == "cancel":
-                log(f"  skip {r['symbol']} {r['pattern']} "
-                    f"{'long' if r['direction'] > 0 else 'short'}: {dec[1]}")
-                continue
-            dead_groups.add(r["group"])           # the other side is off
-            _, stop, target = dec
-            d = r["direction"]
-            sym = r["symbol"]
-            why = None
-            if sym in busy:
-                why = "already traded/held today"
-            elif n_pos >= args.max_positions:
-                why = f"max positions ({args.max_positions})"
-            elif per_pattern.get(r["pattern"], 0) >= args.max_per_pattern:
-                why = f"max {args.max_per_pattern} {r['pattern']} trades today"
-            limit = round(last * (1 + d * args.slippage), 2)
-            stop, target = round(stop, 2), round(target, 2)
-            risk_sh = abs(limit - stop)
-            qty = 0
-            if why is None:
-                if d * (target - limit) < 0.02 or d * (limit - stop) < 0.02:
-                    why = "stop/target too close after rounding"
-                else:
-                    qty = math.floor(min(args.risk * equity / risk_sh,
-                                         args.max_pos_frac * equity / limit))
-                    if gross + qty * limit > args.max_gross * equity:
-                        qty = math.floor((args.max_gross * equity - gross) / limit)
-                    if qty < 1:
-                        why = "no room left (gross exposure cap)"
-            side = "BUY" if d > 0 else "SHORT"
-            if why is not None:
-                log(f"  {side} {sym} {r['pattern']} triggered but skipped: {why}")
-                continue
-            log(f"  {side} {qty} {sym} @ limit {limit:.2f}  stop {stop:.2f}  "
-                f"target {target:.2f}  [{r['pattern']}, armed {r['armed_on']}]")
-            status, oid = "dry_run", ""
-            if args.execute:
-                try:
-                    res = submit_bracket(client, sym, qty, d, limit, stop, target, tif)
-                    status, oid = res.get("status", "submitted"), res.get("id", "")
-                    mine[sym] = {"entered": stamp, "pattern": r["pattern"],
-                                 "direction": d, "order_id": oid}
-                    save_state(acct_id, state)
-                except Exception as e:
-                    status = f"rejected: {str(e)[:120]}"
-                    log(f"    order rejected: {e}")
-            if not status.startswith("rejected"):
-                busy.add(sym)
-                n_pos += 1
-                gross += qty * limit
-                per_pattern[r["pattern"]] = per_pattern.get(r["pattern"], 0) + 1
-            orders.append(dict(time=pd.Timestamp.now(tz=NY).strftime("%H:%M:%S"),
-                               symbol=sym, pattern=r["pattern"], side=side, qty=qty,
-                               limit=limit, stop=stop, target=target,
-                               trigger=round(r["trigger"], 2), status=status,
-                               order_id=oid))
+        orders += book.step(watch, px, pd.Timestamp.now(tz=NY).strftime("%H:%M:%S"), send)
         time.sleep(args.poll_seconds)
 
     # --- end of the window -------------------------------------------------------
@@ -554,6 +593,128 @@ def run_session(args, client):
                                     index=False)
 
 
+# ---------------------------------------------------------------------------
+# Replay: run a past (or today's finished) window on minute bars
+# ---------------------------------------------------------------------------
+
+def minute_bars(symbols, day):
+    """1-minute bars for `day`, 9:30-16:00 ET: symbol -> DataFrame indexed
+    by the bar's START time (NY). Tries SIP, then IEX."""
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from alpaca.data.enums import Adjustment, DataFeed
+    client = data_client()
+    start = pd.Timestamp(f"{day} 09:30", tz=NY)
+    end = pd.Timestamp(f"{day} 16:00", tz=NY)
+    for feed in (DataFeed.SIP, DataFeed.IEX):
+        frames = []
+        try:
+            for i in range(0, len(symbols), 100):
+                req = StockBarsRequest(symbol_or_symbols=symbols[i:i + 100],
+                                       timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                                       start=start.to_pydatetime(), end=end.to_pydatetime(),
+                                       adjustment=Adjustment.ALL, feed=feed)
+                frames.append(client.get_stock_bars(req).df)
+        except Exception as e:
+            log(f"  minute bars refused on {feed} ({str(e)[:70]})")
+            continue
+        frames = [f for f in frames if len(f)]
+        if not frames:
+            continue
+        df = pd.concat(frames)
+        out = {}
+        for sym, g in df.groupby(level="symbol"):
+            g = g.droplevel("symbol").rename(columns=str.capitalize)
+            g.index = pd.to_datetime(g.index).tz_convert(NY)
+            out[sym] = g[["Open", "High", "Low", "Close"]]
+        return out
+    return {}
+
+
+def run_replay(args):
+    """What the trader would have done in the window of one day, using the
+    same scan, entry rules and caps as live; then how each trade stood at
+    that day's close. No orders are sent."""
+    day = (pd.Timestamp.now(tz=NY).date() if args.replay == "today"
+           else pd.Timestamp(args.replay).date())
+    k, s_ = data_keys()
+    if not k or not s_:
+        sys.exit(f"Replay needs Alpaca data keys: set {KEY_VAR}/{SECRET_VAR} "
+                 "(or ALPACA_API_KEY/ALPACA_SECRET_KEY).")
+    patterns = (None if args.patterns == "all"
+                else [p.strip() for p in args.patterns.split(",")])
+    open_t = pd.Timestamp(f"{day} 09:30", tz=NY)
+    end_t = open_t + pd.Timedelta(minutes=args.window_minutes)
+    if pd.Timestamp.now(tz=NY) < end_t + pd.Timedelta(minutes=16):
+        sys.exit(f"The {day} window ends {end_t:%H:%M} ET; Alpaca's free data "
+                 "lags 15 minutes, so replay it after "
+                 f"{end_t + pd.Timedelta(minutes=16):%H:%M} ET.")
+    log(f"REPLAY of {day} {open_t:%H:%M}-{end_t:%H:%M} ET (no orders are sent)")
+
+    bars = get_bars(args, asof=day)
+    lasts = pd.Series([df.index[-1].date() for df in bars.values() if len(df)])
+    last_session = lasts.mode().iloc[0] if len(lasts) else None
+    log(f"  pattern scan on daily bars through {last_session}")
+    rows = todays_setups(bars, patterns, last_session)
+    report_setups(rows, f"replay_{day}")
+    if not rows:
+        log("No armed setups that day.")
+        return
+    mins = minute_bars(sorted({r["symbol"] for r in rows}), day)
+    if not mins:
+        sys.exit(f"No minute bars for {day}: was the market open that day?")
+
+    # cumulative open/high/low/last per minute, aligned on one clock
+    clock = pd.date_range(open_t, end_t - pd.Timedelta(minutes=1), freq="1min")
+    path = {}
+    for sym, m in mins.items():
+        w = m[m.index < end_t]
+        if w.empty:
+            continue
+        cum = pd.DataFrame({"o": w["Open"].iloc[0], "h": w["High"].cummax(),
+                            "l": w["Low"].cummin(), "c": w["Close"]})
+        path[sym] = cum.reindex(clock, method="ffill")
+
+    book = Book(args, args.equity)
+    entries = []
+    for t in clock:
+        px = {sym: tuple(p.loc[t]) for sym, p in path.items()
+              if not p.loc[t].isna().any()}
+        label = (t + pd.Timedelta(minutes=1)).strftime("%H:%M")
+        entries += book.step(rows, px, label, lambda e, r: ("replay", ""))
+
+    # how each trade stood at the close: stop or target hit first (a minute
+    # touching both counts as the stop), else marked at the last price
+    out = []
+    for e in entries:
+        m = mins[e["symbol"]]
+        d = 1 if e["side"] == "BUY" else -1
+        fill = e["last"]
+        after = m[m.index >= pd.Timestamp(f"{day} {e['time']}", tz=NY)]
+        result, exit_px = "open at close", (after["Close"].iloc[-1] if len(after) else fill)
+        for _, b in after.iterrows():
+            if d * ((b["Low"] if d > 0 else b["High"]) - e["stop"]) <= 0:
+                result, exit_px = "stopped", e["stop"]
+                break
+            if d * ((b["High"] if d > 0 else b["Low"]) - e["target"]) >= 0:
+                result, exit_px = "target hit", e["target"]
+                break
+        pnl = d * e["qty"] * (exit_px - fill)
+        out.append(dict(e, fill=round(fill, 2), result=result,
+                        exit=round(exit_px, 2), pnl=round(pnl, 2)))
+    if not out:
+        log("No entries in the window.")
+        return
+    df = pd.DataFrame(out)
+    df.to_csv(os.path.join(LOG_DIR, f"replay_{day}_orders.csv"), index=False)
+    cols = ["time", "side", "qty", "symbol", "pattern", "fill", "stop", "target",
+            "result", "exit", "pnl"]
+    print("\n" + df[cols].to_string(index=False))
+    print(f"\n{len(df)} entries; P&L by the {day} close: ${df['pnl'].sum():,.2f} "
+          f"on ${args.equity:,.0f} (positions still open are marked at the close; "
+          "with --exit hold they would keep running).")
+
+
 def report_setups(rows, stamp):
     os.makedirs(LOG_DIR, exist_ok=True)
     if not rows:
@@ -573,6 +734,11 @@ def main():
     ap.add_argument("--watch", action="store_true",
                     help="dry run through the trading window (needs keys)")
     ap.add_argument("--loop", action="store_true", help="run every trading day")
+    ap.add_argument("--replay", nargs="?", const="today", default=None, metavar="DATE",
+                    help="replay a finished window on minute bars, no orders: "
+                         "--replay (today) or --replay 2026-11-16")
+    ap.add_argument("--equity", type=float, default=100_000,
+                    help="account size assumed by --replay")
     ap.add_argument("--exit", choices=["hold", "flatten"], default="hold",
                     help="hold: keep positions with their stop/target (default); "
                          "flatten: close them at the end of the window")
@@ -603,6 +769,9 @@ def main():
     if bad:
         sys.exit(f"Unknown patterns: {bad}. Choose from {D.ALL_PATTERNS}")
 
+    if args.replay:
+        run_replay(args)
+        return
     client = connect()
     if client is None and (args.execute or args.watch or args.loop):
         sys.exit(f"Set {KEY_VAR} and {SECRET_VAR} (the pattern account's paper keys).")
