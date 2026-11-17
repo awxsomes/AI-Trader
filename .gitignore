@@ -16,3 +16,6 @@ output/intraday/raw/
 .env
 statarb.txt
 keys*.txt
+patterns/logs/
+patterns/state/
+output/patterns/
