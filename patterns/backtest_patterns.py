@@ -158,23 +158,39 @@ def run_ticker(job):
     return rows
 
 
+def clustered_t(x, clusters):
+    """t-statistic of the mean of x with standard errors clustered by
+    `clusters` (calendar month here). Trades bunch up in the same weeks,
+    e.g. many double bottoms after a sell-off, so per-trade t-statistics
+    overstate the evidence."""
+    m = x.mean()
+    s = (x - m).groupby(clusters).sum()
+    g = len(s)
+    if g < 2:
+        return np.nan
+    se = np.sqrt((s ** 2).sum() * g / (g - 1)) / len(x)
+    return m / se if se > 0 else np.nan
+
+
 def summarize(tr, split):
     tr = tr.copy()
     tr["period"] = np.where(pd.to_datetime(tr["entry"]) < pd.Timestamp(split),
                             f"before {split[:4]}", f"{split[:4]} on")
     tr["edge"] = tr["ret"] - tr["baseline"]
     tr["win"] = tr["ret"] > 0
+    tr["month"] = pd.to_datetime(tr["entry"]).dt.to_period("M")
     out = []
     for (pat, per), g in tr.groupby(["pattern", "period"]):
-        e = g["edge"].dropna()
-        se = e.std(ddof=1) / np.sqrt(len(e)) if len(e) > 1 else np.nan
+        g = g.dropna(subset=["edge"])
+        if len(g) < 2:
+            continue
         out.append(dict(pattern=pat, period=per, trades=len(g),
                         long_share=(g["direction"] > 0).mean(),
                         win_rate=g["win"].mean(),
                         mean_ret_bp=1e4 * g["ret"].mean(),
                         random_bp=1e4 * g["baseline"].mean(),
-                        edge_bp=1e4 * e.mean(),
-                        t_stat=e.mean() / se if se and se > 0 else np.nan,
+                        edge_bp=1e4 * g["edge"].mean(),
+                        t_stat=clustered_t(g["edge"], g["month"]),
                         avg_days=g["bars"].mean()))
     return pd.DataFrame(out)
 
@@ -220,13 +236,22 @@ def main():
               f"minus random entries with the same stop/target) ===")
         print(g.drop(columns="period").sort_values("edge_bp", ascending=False)
               .to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
-    # patterns that hold up in BOTH periods
-    piv = sm.pivot(index="pattern", columns="period", values="t_stat")
-    if piv.shape[1] == 2:
-        good = piv[(piv.iloc[:, 0] > 2) & (piv.iloc[:, 1] > 2)].index.tolist()
-        print("\nEdge with t > 2 in both periods: " + (", ".join(good) or "none"))
-        print("Trade only these live: python patterns\\pattern_trade.py --execute "
-              f"--patterns {','.join(good) if good else '<list>'}")
+    # patterns that hold up in BOTH periods: beat random breakouts
+    # (t > 2, clustered by month) AND make money after costs
+    t = sm.pivot(index="pattern", columns="period", values="t_stat")
+    net = sm.pivot(index="pattern", columns="period", values="mean_ret_bp")
+    if t.shape[1] == 2:
+        both = lambda df, c: (df.iloc[:, 0] > c) & (df.iloc[:, 1] > c)
+        good = t[both(t, 2) & both(net, 0)].index.tolist()
+        near = t[both(t, 1.5) & both(net, 0)].index.difference(good).tolist()
+        print("\nBeats random breakouts (t > 2, clustered by month) AND profitable "
+              "after costs, in both periods: " + (", ".join(good) or "none"))
+        print("Near misses (t > 1.5, profitable, both periods): "
+              + (", ".join(near) or "none"))
+        pick = good or near
+        if pick:
+            print("Paper-test these: python patterns\\pattern_trade.py --execute "
+                  f"--patterns {','.join(pick)}")
     print(f"\nSaved {len(tr):,} trades to {os.path.join(OUT, 'trades.csv')}")
 
 
