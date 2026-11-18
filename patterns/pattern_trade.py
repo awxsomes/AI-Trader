@@ -239,7 +239,9 @@ def bars_alpaca(symbols, feed, asof=None):
         g = g.droplevel("symbol")
         g.index = pd.to_datetime(g.index).tz_convert(NY).tz_localize(None).normalize()
         g = g.rename(columns=str.capitalize)[["Open", "High", "Low", "Close"]]
-        out[sym] = g
+        # Alpaca's `end` is inclusive and today's bar is stamped at midnight,
+        # so drop it here: only COMPLETED sessions may feed the scan
+        out[sym] = g[g.index < today.tz_localize(None)]
     return out
 
 
@@ -354,7 +356,7 @@ class Book:
         session so far. send(entry, row) places the order (or not) and
         returns (status, order_id). Returns the entries planned now."""
         a = self.args
-        out = []
+        hits = []
         for k, r in enumerate(watch):
             if k in self.done or r["group"] in self.dead_groups or r["symbol"] not in px:
                 continue
@@ -367,7 +369,18 @@ class Book:
                 log(f"  {label} skip {r['symbol']} {r['pattern']} "
                     f"{'long' if r['direction'] > 0 else 'short'}: {dec[1]}")
                 continue
-            self.dead_groups.add(r["group"])      # the other side is off
+            # how much of the move to the target is already gone at this
+            # price; when several break out in the same check, the caps take
+            # the least-chased first (not alphabetical order)
+            d = r["direction"]
+            trig = r["setup"].levels(r["j"])[0]
+            used = d * (last - trig) / max(d * (dec[2] - trig), 1e-9)
+            hits.append((used, r["symbol"], k, r, dec, last))
+        hits.sort(key=lambda h: (h[0], h[1]))
+        out = []
+        for used, _, k, r, dec, last in hits:
+            if r["group"] in self.dead_groups:
+                continue                          # sibling broke out first
             _, stop, target = dec
             d, sym = r["direction"], r["symbol"]
             why = None
@@ -605,7 +618,8 @@ def minute_bars(symbols, day):
     from alpaca.data.enums import Adjustment, DataFeed
     client = data_client()
     start = pd.Timestamp(f"{day} 09:30", tz=NY)
-    end = pd.Timestamp(f"{day} 16:00", tz=NY)
+    end = min(pd.Timestamp(f"{day} 16:00", tz=NY),
+              pd.Timestamp.now(tz=NY) - pd.Timedelta(minutes=16))
     for feed in (DataFeed.SIP, DataFeed.IEX):
         frames = []
         try:
@@ -620,7 +634,9 @@ def minute_bars(symbols, day):
             continue
         frames = [f for f in frames if len(f)]
         if not frames:
+            log(f"  no minute bars on {feed}")
             continue
+        log(f"  minute bars from {feed}")
         df = pd.concat(frames)
         out = {}
         for sym, g in df.groupby(level="symbol"):
@@ -654,6 +670,9 @@ def run_replay(args):
     bars = get_bars(args, asof=day)
     lasts = pd.Series([df.index[-1].date() for df in bars.values() if len(df)])
     last_session = lasts.mode().iloc[0] if len(lasts) else None
+    if last_session is None or last_session >= day:
+        sys.exit(f"ABORT: daily bars reach {last_session}, not before {day}; "
+                 "the scan would see that day's own prices.")
     log(f"  pattern scan on daily bars through {last_session}")
     rows = todays_setups(bars, patterns, last_session)
     report_setups(rows, f"replay_{day}")
@@ -683,36 +702,110 @@ def run_replay(args):
         label = (t + pd.Timedelta(minutes=1)).strftime("%H:%M")
         entries += book.step(rows, px, label, lambda e, r: ("replay", ""))
 
-    # how each trade stood at the close: stop or target hit first (a minute
-    # touching both counts as the stop), else marked at the last price
+    log(f"  {len(mins)} of {len({r['symbol'] for r in rows})} armed symbols had "
+        f"minute bars; {len(book.done)} setups triggered or were skipped, "
+        f"{len(rows) - len(book.done)} never reached their trigger")
+    if not entries:
+        log("No entries in the window.")
+        return
+
+    # Follow each trade the way the live program would manage it.
+    # Entry day, on minute bars: stop or target first (a minute touching
+    # both counts as the stop); with --exit flatten, closed at window end.
     out = []
     for e in entries:
         m = mins[e["symbol"]]
         d = 1 if e["side"] == "BUY" else -1
         fill = e["last"]
         after = m[m.index >= pd.Timestamp(f"{day} {e['time']}", tz=NY)]
-        result, exit_px = "open at close", (after["Close"].iloc[-1] if len(after) else fill)
+        if args.exit == "flatten":
+            after = after[after.index < end_t]
+        res = dict(result="open", exit=after["Close"].iloc[-1] if len(after) else fill,
+                   exit_date=day, days=0)
         for _, b in after.iterrows():
             if d * ((b["Low"] if d > 0 else b["High"]) - e["stop"]) <= 0:
-                result, exit_px = "stopped", e["stop"]
+                res.update(result="stopped", exit=e["stop"])
                 break
             if d * ((b["High"] if d > 0 else b["Low"]) - e["target"]) >= 0:
-                result, exit_px = "target hit", e["target"]
+                res.update(result="target hit", exit=e["target"])
                 break
-        pnl = d * e["qty"] * (exit_px - fill)
-        out.append(dict(e, fill=round(fill, 2), result=result,
-                        exit=round(exit_px, 2), pnl=round(pnl, 2)))
-    if not out:
-        log("No entries in the window.")
-        return
-    df = pd.DataFrame(out)
+        else:
+            if args.exit == "flatten":
+                res["result"] = f"closed {end_t:%H:%M}"
+        out.append(dict(e, d=d, fill=fill, **res))
+
+    # Later days, on daily bars (hold mode): the stop and target stay on at
+    # Alpaca; after --max-hold-days full sessions the position is closed at
+    # the next open, as the live program does.
+    still = [x for x in out if x["result"] == "open"]
+    if still:
+        later = daily_after(sorted({x["symbol"] for x in still}), day)
+        for x in still:
+            b = later.get(x["symbol"])
+            if b is None or b.empty:
+                x["result"] = "still open"
+                continue
+            d = x["d"]
+            x.update(result="still open", exit=b["Close"].iloc[-1],
+                     exit_date=b.index[-1].date(), days=len(b))
+            for n, (dte, r) in enumerate(b.iterrows(), start=1):
+                hit = None
+                if n > args.max_hold_days:
+                    hit = (f"closed after {args.max_hold_days} days", r["Open"])
+                elif d * (r["Open"] - x["stop"]) <= 0:
+                    hit = ("stopped (gap)", r["Open"])
+                elif d * (r["Open"] - x["target"]) >= 0:
+                    hit = ("target hit (gap)", r["Open"])
+                elif d * ((r["Low"] if d > 0 else r["High"]) - x["stop"]) <= 0:
+                    hit = ("stopped", x["stop"])
+                elif d * ((r["High"] if d > 0 else r["Low"]) - x["target"]) >= 0:
+                    hit = ("target hit", x["target"])
+                if hit:
+                    x.update(result=hit[0], exit=hit[1], exit_date=dte.date(), days=n)
+                    break
+
+    for x in out:
+        x["pnl"] = round(x["d"] * x["qty"] * (x["exit"] - x["fill"]), 2)
+        x["fill"], x["exit"] = round(x["fill"], 2), round(x["exit"], 2)
+    df = pd.DataFrame(out).drop(columns=["d"])
     df.to_csv(os.path.join(LOG_DIR, f"replay_{day}_orders.csv"), index=False)
     cols = ["time", "side", "qty", "symbol", "pattern", "fill", "stop", "target",
-            "result", "exit", "pnl"]
+            "result", "exit_date", "days", "exit", "pnl"]
     print("\n" + df[cols].to_string(index=False))
-    print(f"\n{len(df)} entries; P&L by the {day} close: ${df['pnl'].sum():,.2f} "
-          f"on ${args.equity:,.0f} (positions still open are marked at the close; "
-          "with --exit hold they would keep running).")
+    done = ~df["result"].isin(["still open", "open"])
+    print(f"\n{len(df)} entries; closed: {int(done.sum())} "
+          f"(P&L ${df.loc[done, 'pnl'].sum():,.2f}); still open: {int((~done).sum())} "
+          f"(marked at the latest close: ${df.loc[~done, 'pnl'].sum():,.2f}); "
+          f"total ${df['pnl'].sum():,.2f} on ${args.equity:,.0f}")
+
+
+def daily_after(symbols, day):
+    """Daily bars for the sessions after `day`, up to now (the current
+    session's bar, if any, is partial)."""
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import Adjustment, DataFeed
+    client = data_client()
+    start = pd.Timestamp(day, tz=NY) + pd.Timedelta(days=1)
+    end = pd.Timestamp.now(tz=NY) - pd.Timedelta(minutes=16)
+    if end <= start:
+        return {}
+    for feed in (DataFeed.SIP, DataFeed.IEX):
+        try:
+            req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
+                                   start=start.to_pydatetime(), end=end.to_pydatetime(),
+                                   adjustment=Adjustment.ALL, feed=feed)
+            df = client.get_stock_bars(req).df
+        except Exception as e:
+            log(f"  daily bars after {day} refused on {feed} ({str(e)[:60]})")
+            continue
+        out = {}
+        for sym, g in df.groupby(level="symbol"):
+            g = g.droplevel("symbol").rename(columns=str.capitalize)
+            g.index = pd.to_datetime(g.index).tz_convert(NY).tz_localize(None).normalize()
+            out[sym] = g[g.index > pd.Timestamp(day)][["Open", "High", "Low", "Close"]]
+        return out
+    return {}
 
 
 def report_setups(rows, stamp):
